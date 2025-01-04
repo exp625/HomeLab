@@ -1,0 +1,22 @@
+[Unit]
+Description=Mosquitto MQTT Container
+After=local-fs.target network-online.target
+
+[Container]
+Image=docker.io/eclipse-mosquitto:latest
+ContainerName=mosquitto
+AutoUpdate=registry
+
+PublishPort=1883:1883
+PublishPort=9001:9001
+
+Volume=/home/admin/config/mosquitto/config:/mosquitto/config:Z
+Volume=/home/admin/config/mosquitto/data:/mosquitto/data:Z
+Volume=/home/admin/config/mosquitto/log:/mosquitto/log:Z
+
+[Service]
+Restart=always
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target default.target
