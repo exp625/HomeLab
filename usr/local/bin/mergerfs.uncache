@@ -1,0 +1,217 @@
+#!/usr/bin/python3
+import argparse
+import shutil
+import io
+import sys
+import subprocess
+import syslog
+import shlex
+import time
+import fnmatch
+from pathlib import Path
+
+
+def print_args(args):
+    quoted = [shlex.quote(arg) for arg in args]
+    print(' '.join(quoted))
+
+def match(filename, matches, base):
+    for match in matches:
+        if fnmatch.fnmatch(filename, str(base)+match):
+            return True
+    return False
+
+
+if __name__ == "__main__":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer,
+                                  encoding='utf8',
+                                  errors='backslashreplace',
+                                  line_buffering=True)
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer,
+                                  encoding='utf8',
+                                  errors='backslashreplace',
+                                  line_buffering=True)
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "-s",
+        "--source",
+        dest="source",
+        type=Path,
+        help="Source path (i.e., cache pool root path).",
+    )
+    parser.add_argument(
+        "-d",
+        "--destination",
+        dest="destination",
+        type=Path,
+        help="Destination path (i.e., slow pool root path).",
+    )
+    parser.add_argument(
+        "--num-files",
+        dest="num_files",
+        default=-1,
+        type=int,
+        help="Maximum number of files moved away from cache.",
+    )
+    parser.add_argument(
+        "--time-limit",
+        dest="time_limit",
+        default=-1,
+        type=int,
+        help="Time limit for the whole process (in seconds). Once reached program exits.",
+    )
+    parser.add_argument(
+        "-E",
+        "--exclude",
+        dest='exclude',
+        type=str,
+        action='append',
+        default=[],
+        help="Paths to exclude from the uncaching process.",
+    )
+    parser.add_argument(
+        "-I",
+        "--includes",
+        dest='includes',
+        type=str,
+        action='append',
+        default=[],
+        help="Paths to include in the uncaching process.",
+    )
+    parser.add_argument(
+        "-t",
+        "--target",
+        dest="target",
+        type=int,
+        help="Desired max cache usage, in percentage (e.g., 70).",
+    )
+    parser.add_argument(
+        "-v", "--verbose", help="Increase output verbosity.", action="store_true"
+    )
+    args = parser.parse_args()
+
+    # Some general checks
+    cache_path: Path = args.source
+    if not cache_path.is_dir():
+        raise NotADirectoryError(f"{cache_path} is not a valid directory.")
+    slow_path: Path = args.destination
+    if not slow_path.is_dir():
+        raise NotADirectoryError(f"{slow_path} is not a valid directory.")
+
+    # Process exclude arguments
+    excludes = args.exclude
+    includes = args.includes
+
+    last_id = args.num_files
+    time_limit = args.time_limit
+
+    target = float(args.target)
+    if target < 0 or target >= 100:
+        raise ValueError(
+            f"Target value is in percentage, i.e., in the range of (0, 100). Found {target} instead."
+        )
+
+    cache_stats = shutil.disk_usage(cache_path)
+
+    usage_percentage = 100 * cache_stats.used / cache_stats.total
+    print(f"Uncaching from {cache_path} ({usage_percentage:.2f}% used) to {slow_path}.")
+    if usage_percentage <= target:
+        print(f"Target of {target}% of used capacity already reached. Exiting.")
+        exit(0)
+
+
+
+    print("Computing candidates...")
+    candidates = []
+    for include_path in includes:
+        path: Path = Path(str(cache_path)+str(include_path))
+        candidates.extend((sorted(
+            [(c, c.stat()) for c in path.glob("**/*") if c.is_file() and not match(str(c), excludes, cache_path)],
+            key=lambda p: p[1].st_size,
+            reverse=True,
+        )))
+
+    t_start = time.monotonic()
+    print("Processing candidates...")
+    cache_used = cache_stats.used
+
+
+
+    last_processed_directory = None
+
+    for c_id, (c_path, c_stat) in enumerate(candidates):
+        # Ensure all files within the same directory are moved together
+        if last_processed_directory and c_path.parent != last_processed_directory:
+            last_processed_directory = None
+
+        if not c_path.exists():
+            print(f"{c_path} does not exist.")
+            continue
+
+        if last_processed_directory is None or c_path.parent != last_processed_directory:
+            # Move all files within the same directory
+            files_in_directory = list(c_path.parent.glob("*"))
+            for file_to_move in files_in_directory:
+                if match(str(file_to_move), excludes, cache_path):
+                    continue
+                args = [
+                    "rsync",
+                    "-avHAXWE",
+                    "--progress",
+                    "--preallocate",
+                    "--numeric-ids",
+                    "--remove-source-files",
+                    '--relative',
+                    f"{cache_path}/./{file_to_move.relative_to(cache_path)}",
+                    f"{slow_path}/",
+                ]
+                print_args(args)
+                cache_used -= file_to_move.stat().st_size
+                subprocess.call(args, stdout=sys.stdout, stderr=subprocess.STDOUT)
+
+            last_processed_directory = c_path.parent
+
+        # Evaluate early breaking conditions
+        if last_id >= 0 and c_id >= last_id - 1:
+            print(f"Maximum number of moved files reached ({last_id}).")
+            break
+        if time_limit >= 0 and time.monotonic() - t_start > time_limit:
+            print(f"Time limit reached ({time_limit} seconds).")
+            break
+        if (100 * cache_used / cache_stats.total) <= target:
+            print(f"Target of maximum used capacity reached ({target}).")
+            break
+
+    cache_stats = shutil.disk_usage(cache_path)
+    usage_percentage = 100 * cache_stats.used / cache_stats.total
+    print(f"Process completed in {round(time.monotonic() - t_start)} seconds. Current usage percentage is {usage_percentage:.2f}%.")
+
+    exclude_conditions = []
+    for exclude_path in excludes:
+        exclude_conditions.append("-o")
+        exclude_conditions.append("-path")
+        exclude_conditions.append(f"{cache_path}{exclude_path}")
+    exclude_conditions.pop(0)
+    # Remove empty folders only from include paths
+    for include_path in includes:
+        args = [
+            "find",
+            f"{cache_path}{include_path}",
+            "(",
+            "-type",
+            "d",
+            "-empty",
+            "-not",
+            "(",
+            *exclude_conditions,
+            ")",
+            ")",
+            "-prune",
+            "-exec",
+            "rmdir",
+            "{}",
+            ";",
+        ]
+        print_args(args)
+        subprocess.call(args, stdout=sys.stdout, stderr=subprocess.STDOUT)
