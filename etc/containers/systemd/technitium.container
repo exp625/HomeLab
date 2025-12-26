@@ -1,0 +1,24 @@
+[Unit]
+Description=Technitium Recursive DNS Server
+Documentation=https://technitium.com/dns/
+
+[Container]
+AutoUpdate=registry
+ContainerName=dns
+HostName=dns01
+Image=docker.io/technitium/dns-server:latest
+PublishPort=5380:5380/tcp
+PublishPort=53443:53443/tcp
+PublishPort=53:53/tcp
+PublishPort=53:53/udp
+PublishPort=853:853/tcp
+PublishPort=853:853/udp
+Volume=/home/admin/config/technitium:/etc/dns:Z
+Volume=/etc/localtime:/etc/localtime:ro
+
+[Service]
+TimeoutStartSec=90
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target
